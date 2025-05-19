@@ -1,59 +1,104 @@
-import { notesIndex } from "@/lib/db/pinecone";
-import prisma from "@/lib/db/prisma";
-import openai, { getEmbedding } from "@/lib/openai";
-import { auth } from "@clerk/nextjs";
-import { OpenAIStream, StreamingTextResponse } from "ai";
-import { ChatCompletionMessage } from "openai/resources/index.mjs";
+import { NextResponse } from "next/server"
+import OpenAI from "openai"
+import prisma from "@/lib/db/prisma"
+import { auth } from "@clerk/nextjs"
 
-export async function POST(req: Request) {
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+})
+
+export async function POST(request: Request) {
   try {
-    const body = await req.json();
-    const messages: ChatCompletionMessage[] = body.messages;
+    const { userId } = auth()
+    if (!userId) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+    }
 
-    const messagesTruncated = messages.slice(-6);
+    const body = await request.json()
+    const { messages, personaId } = body
 
-    const embedding = await getEmbedding(
-      messagesTruncated.map((message) => message.content).join("\n"),
-    );
+    if (!personaId) {
+      return NextResponse.json(
+        { error: "Persona ID is required" },
+        { status: 400 }
+      )
+    }
 
-    const { userId } = auth();
+    // Get persona from database
+    const persona = await prisma.persona.findUnique({
+      where: { 
+        id: personaId,
+        userId // Ensure the persona belongs to the user
+      }
+    })
 
-    const vectorQueryResponse = await notesIndex.query({
-      vector: embedding,
-      topK: 4,
-      filter: { userId },
-    });
+    if (!persona) {
+      return NextResponse.json(
+        { error: "Persona not found" },
+        { status: 404 }
+      )
+    }
 
-    const relevantNotes = await prisma.note.findMany({
-      where: {
-        id: {
-          in: vectorQueryResponse.matches.map((match) => match.id),
-        },
-      },
-    });
-
-    console.log("Relevant notes found: ", relevantNotes);
-
-    const systemMessage: ChatCompletionMessage = {
+    // Prepare system message with persona details
+    const systemMessage = {
       role: "system",
-      content:
-        "You are an intelligent note-taking app. You answer the user's question based on their existing notes. " +
-        "The relevant notes for this query are:\n" +
-        relevantNotes
-          .map((note) => `Title: ${note.title}\n\nContent:\n${note.content}`)
-          .join("\n\n"),
-    };
+      content: `You are ${persona.name}, a ${persona.age}-year-old ${persona.gender} from ${persona.location}. 
+      You work as a ${persona.occupation}. 
+      Your bio: ${persona.bio}
+      Your interests: ${persona.interests.join(", ")}
+      Your personality traits: ${persona.personality.join(", ")}
+      You are looking for: ${persona.lookingFor}
+      
+      Respond as this persona would, maintaining their personality, interests, and communication style.`
+    }
 
-    const response = await openai.chat.completions.create({
-      model: "gpt-3.5-turbo",
-      stream: true,
-      messages: [systemMessage, ...messagesTruncated],
-    });
+    // Add system message to the beginning of the conversation
+    const messagesWithSystem = [systemMessage, ...messages]
 
-    const stream = OpenAIStream(response);
-    return new StreamingTextResponse(stream);
+    let response
+    if (persona.model === "grok") {
+      // Call Grok API
+      const grokResponse = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/grok`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          messages: messagesWithSystem,
+          systemPrompt: systemMessage.content
+        }),
+      })
+
+      if (!grokResponse.ok) {
+        const errorData = await grokResponse.json()
+        console.error("Grok API error:", errorData)
+        throw new Error("Failed to get response from Grok")
+      }
+
+      response = await grokResponse.json()
+    } else {
+      // Call OpenAI API
+      try {
+        const completion = await openai.chat.completions.create({
+          model: "gpt-4",
+          messages: messagesWithSystem,
+        })
+
+        response = {
+          content: completion.choices[0].message.content
+        }
+      } catch (error) {
+        console.error("OpenAI API error:", error)
+        throw new Error("Failed to get response from OpenAI")
+      }
+    }
+
+    return NextResponse.json(response)
   } catch (error) {
-    console.error(error);
-    return Response.json({ error: "Internal server error" }, { status: 500 });
+    console.error("Error in chat API:", error)
+    return NextResponse.json(
+      { error: error instanceof Error ? error.message : "Failed to get response" },
+      { status: 500 }
+    )
   }
 }
